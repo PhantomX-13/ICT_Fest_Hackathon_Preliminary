@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import os
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -20,8 +21,9 @@ from .errors import AppError
 from .models import User
 
 # Access tokens presented to /auth/logout are recorded here so they can no
-# longer be used.
+# longer be used. Refresh tokens are also recorded after a successful rotate.
 _revoked_tokens: set[str] = set()
+_revoked_lock = threading.Lock()
 
 _PBKDF2_ROUNDS = 100_000
 
@@ -47,7 +49,7 @@ def _now_ts() -> int:
 
 def create_access_token(user: User) -> str:
     iat = _now_ts()
-    lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
+    lifetime = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(user.id),
         "org": user.org_id,
@@ -83,7 +85,31 @@ def decode_token(token: str) -> dict:
 
 
 def revoke_access_token(payload: dict) -> None:
-    _revoked_tokens.add(payload["jti"])
+    revoke_token_jti(payload["jti"])
+
+
+def revoke_token_jti(jti: str) -> None:
+    with _revoked_lock:
+        _revoked_tokens.add(jti)
+
+
+def is_token_revoked(jti: str) -> bool:
+    with _revoked_lock:
+        return jti in _revoked_tokens
+
+
+def consume_token_jti(jti: str | None) -> bool:
+    """Atomically mark a refresh-token jti as used.
+
+    Returns False when the token was missing or had already been consumed.
+    """
+    if not jti:
+        return False
+    with _revoked_lock:
+        if jti in _revoked_tokens:
+            return False
+        _revoked_tokens.add(jti)
+        return True
 
 
 def get_token_payload(request: Request) -> dict:
@@ -94,7 +120,7 @@ def get_token_payload(request: Request) -> dict:
     payload = decode_token(token)
     if payload.get("type") != "access":
         raise AppError(401, "UNAUTHORIZED", "Wrong token type")
-    if payload.get("sub") in _revoked_tokens:
+    if is_token_revoked(payload.get("jti")):
         raise AppError(401, "UNAUTHORIZED", "Token has been revoked")
     return payload
 
